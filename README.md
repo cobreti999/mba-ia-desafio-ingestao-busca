@@ -1,155 +1,106 @@
-# Ingestão e Busca Semântica com LangChain e Postgres
+# Consulta a PDF com LangChain e pgVector
 
-## Objetivo
+Aplicação Python que extrai texto de um PDF, armazena seus embeddings no PostgreSQL e responde perguntas no terminal usando os trechos recuperados.
 
-Você deve entregar um software capaz de:
+Base: [devfullcycle/mba-ia-desafio-ingestao-busca](https://github.com/devfullcycle/mba-ia-desafio-ingestao-busca), commit `dba3926db2ef4b985569c51d5c8ace6e2c571b06`. O `document.pdf` e o `docker-compose.yml` são os arquivos originais do exemplo.
 
-- Ingestão: Ler um arquivo PDF e salvar suas informações em um banco de dados PostgreSQL com extensão pgVector.
-- Busca: Permitir que o usuário faça perguntas via linha de comando (CLI) e receba respostas baseadas apenas no conteúdo do PDF.
+## Pré-requisitos
 
-## Exemplo no CLI
+- Python 3.12 (versão usada na validação).
+- Docker e Docker Compose v2 em execução; porta 5432 disponível.
+- `OPENAI_API_KEY` no ambiente, com acesso aos modelos indicados e saldo na API.
 
-Faça sua pergunta:
+## Instalação
 
+Na pasta do projeto, crie e ative o ambiente virtual **antes** de instalar:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
-PERGUNTA: Qual o faturamento da Empresa SuperTechIABrazil?
-RESPOSTA: O faturamento foi de 10 milhões de reais.
 
----
+Se `python3` não for Python 3.12, use `python3.12 -m venv venv`. No Windows, a ativação é `venv\Scripts\activate`.
 
-Perguntas fora do contexto:
+A chave já exportada no environment será usada automaticamente; `.env` não sobrescreve variáveis existentes. Se necessário, configure a chave apenas no `.env` local. Esse arquivo e o ambiente virtual são ignorados pelo Git.
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `OPENAI_API_KEY` | obrigatório | Autenticação na OpenAI |
+| `DATABASE_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/rag` | Conexão compatível com o Compose |
+| `PDF_PATH` | `document.pdf` | Caminho absoluto ou relativo à raiz do projeto |
+| `COLLECTION_NAME` | `pdf_documents` | Prefixo da coleção vetorial |
+
+## Execução
+
+Com o ambiente virtual ativo:
+
+```bash
+# 1. Banco
+ docker compose up -d
+ docker compose ps -a
+# Aguarde postgres saudável e bootstrap_vector_ext concluído com código 0.
+
+# 2. Ingestão
+python src/ingest.py
+
+# 3. Chat
+python src/chat.py
+```
+
+Digite `sair`, `exit`, `quit`, Ctrl+C ou Ctrl+D para encerrar. Perguntas vazias são ignoradas. Cada pergunta é independente, sem histórico enviado à LLM.
+
+O PDF fornecido contém empresas, faturamentos e anos de fundação. Exemplo baseado nesse PDF:
+
+```text
+PERGUNTA: Qual o faturamento da Alfa Agronegócio Indústria?
+RESPOSTA: O faturamento da Alfa Agronegócio Indústria é R$ 85.675.568,77.
 
 PERGUNTA: Quantos clientes temos em 2024?
 RESPOSTA: Não tenho informações necessárias para responder sua pergunta.
 ```
 
-## Tecnologias obrigatórias
+A redação da resposta factual pode variar. SuperTechIABrazil e o faturamento de 10 milhões apresentados no enunciado são ilustrativos; a aplicação não insere esses dados no PDF.
 
-- Linguagem: Python
-- Framework: LangChain
-- Banco de dados: PostgreSQL + pgVector
-- Execução do banco de dados: Docker & Docker Compose (docker-compose fornecido no repositório de exemplo)
+## Funcionamento
 
-## Pacotes recomendados
+- `src/ingest.py`: `PyPDFLoader` extrai páginas; `RecursiveCharacterTextSplitter` divide em chunks de até **1000 caracteres**, com **overlap configurado de 150**. Separadores e limites de página podem reduzir a sobreposição efetiva.
+- `OpenAIEmbeddings(model="text-embedding-3-small")` gera os vetores; `PGVector` persiste texto, metadados e embeddings.
+- A coleção inclui o SHA-256 do PDF. Alterar o PDF seleciona outra coleção; rode a ingestão novamente. Os dados anteriores permanecem armazenados, mas não entram nas consultas ao novo PDF.
+- IDs determinísticos evitam duplicação. Uma nova ingestão consulta os IDs existentes e só gera embeddings para os chunks ausentes. Execute uma ingestão por vez.
+- `src/search.py` chama `similarity_search_with_score(question, k=10)`. O próprio PGVector vetoriza a pergunta com o mesmo modelo de embeddings. Os scores são distâncias, não probabilidades de a resposta estar correta.
+- Os resultados são concatenados no prompt solicitado e enviados a `gpt-5-nano`, com `reasoning_effort="minimal"` e limite de 2048 tokens de conclusão. Uma mensagem de sistema reforça que instruções contidas no PDF não podem alterar as regras.
+- Sem contexto, a resposta de ausência de informação é retornada sem chamar a LLM. Respostas vazias ou truncadas também retornam essa mensagem.
 
-- Split: `from langchain_text_splitters import RecursiveCharacterTextSplitter`
-- Embeddings (OpenAI): `from langchain_openai import OpenAIEmbeddings`
-- Embeddings (Gemini): `from langchain_google_genai import GoogleGenerativeAIEmbeddings`
-- PDF: `from langchain_community.document_loaders import PyPDFLoader`
-- Ingestão: `from langchain_postgres import PGVector`
-- Busca: `similarity_search_with_score(query, k=10)`
+## Custos e limites
 
-## OpenAI
+A primeira ingestão cobra embeddings do texto. Repetições completas não geram novos embeddings. Cada pergunta não vazia gera um embedding e, quando há contexto, uma chamada à LLM. Os trechos recuperados e a pergunta são enviados à OpenAI. Não há chamadas de busca na web.
 
-- Crie uma API Key da OpenAI.
-- Você vai precisar de um modelo de embeddings e de um modelo de LLM para responder. Consulte a documentação oficial da OpenAI para ver os modelos disponíveis.
+O prompt restringe o modelo ao contexto, mas uma LLM não oferece garantia absoluta contra alucinações ou instruções maliciosas. A recuperação dos dez trechos também pode deixar uma informação relevante de fora. Valide respostas críticas contra o PDF. PDFs digitalizados sem camada textual precisam de OCR prévio; OCR não está incluído.
 
-## Gemini
+## Testes
 
-- Crie uma API Key da Google.
-- Você vai precisar de um modelo de embeddings e de um modelo de LLM para responder. Consulte a documentação oficial do Google para ver os modelos disponíveis.
+Testes locais sem custos de API e sem banco:
 
-Os limites de requisições gratuitas dos modelos podem mudar com frequência. Para informações atualizadas, consulte a documentação oficial do Google.
-
-## Escolha dos modelos
-
-Este desafio não fixa modelos. Nomes e versões mudam com frequência e alguns são descontinuados, então faz parte do desafio consultar a documentação oficial do provedor que você escolher, ver quais modelos estão disponíveis no momento e selecionar os que atendem ao objetivo. Para o volume deste desafio, os modelos mais leves e baratos de cada provedor são suficientes.
-
-Atenção: modelos de embedding diferentes geram vetores com dimensões diferentes. A tabela de vetores é criada na primeira ingestão, já com a dimensão do modelo que você escolheu. Se você trocar de modelo de embeddings depois disso, a ingestão passa a falhar por incompatibilidade de dimensão. Nesse caso é responsabilidade sua apagar a collection existente (ou o volume do banco) e refazer a ingestão do zero com o novo modelo.
-
-## Requisitos
-
-### 1. Ingestão do PDF
-
-- O PDF deve ser dividido em chunks de 1000 caracteres com overlap de 150.
-- Cada chunk deve ser convertido em embedding.
-- Os vetores devem ser armazenados no banco de dados PostgreSQL com pgVector.
-
-### 2. Consulta via CLI
-
-Criar um script Python para simular um chat no terminal.
-
-Passos ao receber uma pergunta:
-
-- Vetorizar a pergunta.
-- Buscar os 10 resultados mais relevantes (k=10) no banco vetorial.
-- Montar o prompt e chamar a LLM.
-- Retornar a resposta ao usuário.
-
-Prompt a ser utilizado:
-
-```
-CONTEXTO:
-{resultados concatenados do banco de dados}
-
-REGRAS:
-- Responda somente com base no CONTEXTO.
-- Se a informação não estiver explicitamente no CONTEXTO, responda:
-  "Não tenho informações necessárias para responder sua pergunta."
-- Nunca invente ou use conhecimento externo.
-- Nunca produza opiniões ou interpretações além do que está escrito.
-
-EXEMPLOS DE PERGUNTAS FORA DO CONTEXTO:
-Pergunta: "Qual é a capital da França?"
-Resposta: "Não tenho informações necessárias para responder sua pergunta."
-
-Pergunta: "Quantos clientes temos em 2024?"
-Resposta: "Não tenho informações necessárias para responder sua pergunta."
-
-Pergunta: "Você acha isso bom ou ruim?"
-Resposta: "Não tenho informações necessárias para responder sua pergunta."
-
-PERGUNTA DO USUÁRIO:
-{pergunta do usuário}
-
-RESPONDA A "PERGUNTA DO USUÁRIO"
+```bash
+python -m unittest discover -s tests -v
+python -m pip check
 ```
 
-## Estrutura obrigatória do projeto
+Validação integrada (usa a API): execute a ingestão duas vezes; a segunda deve informar zero novos chunks. No chat, teste uma empresa do PDF, uma pergunta fora do contexto e uma tentativa de instruir o modelo a ignorar as regras.
 
-Faça um fork do repositório para utilizar a estrutura abaixo: https://github.com/devfullcycle/mba-ia-desafio-ingestao-busca
+## Problemas comuns
 
-```
-├── docker-compose.yml
-├── requirements.txt      # Dependências
-├── .env.example          # Template das variáveis de ambiente
-├── src/
-│   ├── ingest.py         # Script de ingestão do PDF
-│   ├── search.py         # Script de busca
-│   ├── chat.py           # CLI para interação com usuário
-├── document.pdf          # PDF para ingestão
-└── README.md             # Instruções de execução
-```
+- **Conexão recusada:** confira `docker compose ps -a`, aguarde o healthcheck e verifique a porta 5432.
+- **Porta ocupada ou container postgres_rag existente:** resolva o conflito ou ajuste o Compose e `DATABASE_URL` para apontarem ao mesmo banco.
+- **Erro OpenAI:** verifique chave, acesso aos modelos, saldo, limites e conexão de rede. Erros operacionais são exibidos separadamente da resposta de ausência de informação.
+- **Sem resposta após trocar o PDF:** execute `python src/ingest.py` novamente.
+- **PDF sem texto:** aplique OCR antes da ingestão.
 
-## VirtualEnv para Python
+Para parar o banco preservando os dados: `docker compose down`. O volume persiste entre reinicializações. As credenciais do Compose original são destinadas ao desenvolvimento local.
 
-Crie e ative um ambiente virtual antes de instalar dependências:
+## Referências
 
-```
-python3 -m venv venv
-source venv/bin/activate
-```
-
-## Ordem de execução
-
-1. Subir o banco de dados:
-
-```
-docker compose up -d
-```
-
-2. Executar ingestão do PDF:
-
-```
-python src/ingest.py
-```
-
-3. Rodar o chat:
-
-```
-python src/chat.py
-```
-
-## Entregável
-
-Repositório público no GitHub contendo todo o código-fonte e README com instruções claras de execução do projeto.
+- [Integração PGVector do LangChain](https://docs.langchain.com/oss/python/integrations/vectorstores/pgvector)
+- [Modelo GPT-5 nano — OpenAI](https://developers.openai.com/api/docs/models/gpt-5-nano)
